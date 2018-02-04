@@ -1,0 +1,146 @@
+#!/bin/bash
+
+# Original steps from: https://www.digitalocean.com/community/tutorials/how-to-set-up-an-ikev2-vpn-server-with-strongswan-on-ubuntu-16-04
+#
+# Run this in an Ubuntu environment, e.g. on Amazon EC2.
+# The script will ask for server name (IP or hostname), username, and password, but if you want to
+# do this programmatically, you can set environment variables $vpn_username and $vpn_password, then
+# run with --no-prompt.
+#
+# Right now, it generates the root certificate on the server which isn't ideal. A future version will
+# change this so they can be generated locally and uploaded to the server instead.
+#
+# After this is all set you  will first need to download ~/vpn-certs/server-root-cert.pem and install it.
+# Make sure it's set to allow IPSec connections. After that, make a new VPN connection, and set server address
+# and Remote ID to the server name, configure authentication to use your username and password, then connect.
+
+if [ "$1" != "--no-prompt" ]
+then
+    # If "--no-prompt" is passed in, will use env var instead
+    echo -n "Server name: "
+    read SERVER_NAME
+    echo -n "Username: "
+    read USER_NAME
+    echo -n "Password: "
+    read -s USER_PASSWORD
+fi
+
+DEBIAN_FRONTEND=noninteractive
+
+sudo apt-get update
+sudo apt-get install -y strongswan strongswan-plugin-eap-mschapv2 moreutils iptables-persistent
+
+mkdir vpn-certs
+cd vpn-certs
+
+ipsec pki --gen --type rsa --size 4096 --outform pem > server-root-key.pem
+chmod 600 server-root-key.pem
+
+ipsec pki --self --ca --lifetime 3650 \
+--in server-root-key.pem \
+--type rsa --dn "C=US, O=VPN Server, CN=VPN Server Root CA" \
+--outform pem > server-root-ca.pem
+
+ipsec pki --gen --type rsa --size 4096 --outform pem > vpn-server-key.pem
+
+ipsec pki --pub --in vpn-server-key.pem \
+--type rsa | ipsec pki --issue --lifetime 1825 \
+--cacert server-root-ca.pem \
+--cakey server-root-key.pem \
+--dn "C=US, O=VPN Server, CN=$SERVER_NAME" \
+--san $SERVER_NAME \
+--flag serverAuth --flag ikeIntermediate \
+--outform pem > vpn-server-cert.pem
+
+sudo cp ./vpn-server-cert.pem /etc/ipsec.d/certs/vpn-server-cert.pem
+sudo cp ./vpn-server-key.pem /etc/ipsec.d/private/vpn-server-key.pem
+
+sudo chown root /etc/ipsec.d/private/vpn-server-key.pem
+sudo chgrp root /etc/ipsec.d/private/vpn-server-key.pem
+sudo chmod 600 /etc/ipsec.d/private/vpn-server-key.pem
+
+
+# Strongswan
+
+sudo cp /etc/ipsec.conf /etc/ipsec.conf.original
+echo '' | sudo tee /etc/ipsec.conf
+
+echo "config setup
+  charondebug=\"ike 1, knl 1, cfg 0\"
+  uniqueids=no
+
+conn ikev2-vpn
+  auto=add
+  compress=no
+  type=tunnel
+  keyexchange=ikev2
+  fragmentation=yes
+  forceencaps=yes
+  ike=aes256-sha1-modp1024,3des-sha1-modp1024!
+  esp=aes256-sha1,3des-sha1!
+  dpdaction=clear
+  dpddelay=300s
+  rekey=no
+  left=%any
+  leftid=@$SERVER_NAME
+  leftcert=/etc/ipsec.d/certs/vpn-server-cert.pem
+  leftsendcert=always
+  leftsubnet=0.0.0.0/0
+  right=%any
+  rightid=%any
+  rightauth=eap-mschapv2
+  rightsourceip=10.10.10.0/24
+  rightdns=8.8.8.8,8.8.4.4
+  rightsendcert=never
+  eap_identity=%identity" | sudo tee /etc/ipsec.conf
+
+echo "$SERVER_NAME : RSA \"/etc/ipsec.d/private/vpn-server-key.pem\"
+$USER_NAME %any% : EAP \"$USER_PASSWORD\"" | sudo tee -a /etc/ipsec.secrets
+
+sudo ipsec reload
+
+
+# Clear existing routing
+sudo ufw disable
+
+sudo iptables -P INPUT ACCEPT
+sudo iptables -P FORWARD ACCEPT
+sudo iptables -F
+sudo iptables -Z
+
+# Loopback and TCP
+sudo iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+sudo iptables -A INPUT -i lo -j ACCEPT
+
+# IPSec connections
+sudo iptables -A INPUT -p udp --dport  500 -j ACCEPT
+sudo iptables -A INPUT -p udp --dport 4500 -j ACCEPT
+
+# Forward ESP traffic
+sudo iptables -A FORWARD --match policy --pol ipsec --dir in  --proto esp -s 10.10.10.10/24 -j ACCEPT
+sudo iptables -A FORWARD --match policy --pol ipsec --dir out --proto esp -d 10.10.10.10/24 -j ACCEPT
+
+# Forward routing
+sudo iptables -t nat -A POSTROUTING -s 10.10.10.10/24 -o eth0 -m policy --pol ipsec --dir out -j ACCEPT
+sudo iptables -t nat -A POSTROUTING -s 10.10.10.10/24 -o eth0 -j MASQUERADE
+
+sudo iptables -t mangle -A FORWARD --match policy --pol ipsec --dir in -s 10.10.10.10/24 -o eth0 -p tcp -m tcp --tcp-flags SYN,RST SYN -m tcpmss --mss 1361:1536 -j TCPMSS --set-mss 1360
+
+# Drop everything else
+sudo iptables -A INPUT -j DROP
+sudo iptables -A FORWARD -j DROP
+
+sudo netfilter-persistent save
+sudo netfilter-persistent reload
+
+
+###
+
+echo "net.ipv4.ip_forward=1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.ip_no_pmtu_disc = 1" | sudo tee -a /etc/sysctl.conf
+
+sudo reboot
+

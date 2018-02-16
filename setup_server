@@ -4,7 +4,7 @@
 #
 # Run this in an Ubuntu environment, e.g. on Amazon EC2.
 # The script will ask for server name (IP or hostname), username, and password, but if you want to
-# do this programmatically, you can set environment variables $vpn_username and $vpn_password, then
+# do this programmatically, you can set environment variables $SERVER_NAME, $USER_NAME, $USER_PASSWORD, then
 # run with --no-prompt.
 #
 # Right now, it generates the root certificate on the server which isn't ideal. A future version will
